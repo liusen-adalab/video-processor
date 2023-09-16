@@ -1,369 +1,166 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+#![allow(unused)]
+mod transcode;
 
-use parking_lot::RwLock;
-use utils::id_new_type;
+use std::{
+    any::Any,
+    collections::{HashMap, VecDeque},
+};
 
-mod aa;
-mod bb;
-mod cc;
+use tokio::sync::mpsc;
 
-#[derive(Clone)]
-pub struct Manager {
-    task_res_subscriber: tokio::sync::mpsc::UnboundedSender<TaskEvent>,
-    tasks: HashMap<TaskId, Arc<RwLock<Task>>>,
-    workers: Arc<RwLock<HashMap<WorkerId, Worker>>>,
-}
+pub struct TaskRaw {}
 
-struct ManagerInner {
-    tasks: HashMap<TaskId, Task>,
-    workers: HashMap<WorkerId, Worker>,
-}
-
-pub fn manager() -> &'static Manager {
-    todo!()
-}
-
-id_new_type!(TaskId);
-
-pub struct Task {
-    id: TaskId,
-    progress: Progress,
-    inner: TaskInner,
-}
-
-pub enum TaskInner {
-    Parse(ParseTask),
-    Thumbnail(ThumbnailTask),
-    Transcode(TranscodeTask),
-}
-
-pub struct TranscodeTask {
-    id: i64,
-    path: PathBuf,
-}
-
-pub struct ParseTask {
-    id: i64,
-    path: PathBuf,
-}
-
-pub struct ThumbnailTask {
-    id: i64,
-    path: PathBuf,
-    dst_dir: PathBuf,
-}
-
-pub struct TranscodeJob {
-    task_id: i64,
-    path: PathBuf,
-}
-
-use bitflags::bitflags;
-
-bitflags! {
-    #[derive(Debug, Clone, Copy)]
-    pub struct ProcessedWorks: i16 {
-        const Origin         = 0;
-        const Demuxed        = 1 << 1;
-        const Splited        = 1 << 2;
-        const H264Done       = 1 << 3;
-        const AudioDone      = 1 << 4;
-        const Muxed          = 1 << 5;
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum TaskStep {
-    /// 已转为 264 编码
-    H264Converted,
-    /// 已分流存储
-    Demuxed,
-    /// 已切片
-    Splited,
-}
-id_new_type!(WorkerId);
-
-type WorkerAddress = tokio::sync::mpsc::UnboundedSender<Arc<WorkerJob>>;
-
-pub struct Worker {
-    id: WorkerId,
-    mailbox: WorkerAddress,
-    info: WorkerInfo,
-    status: WorkerStatus,
-}
-
-pub struct WorkerInfo {
-    ip: String,
-    port: u16,
-    process_id: i64,
-    w_type: WorkerType,
-}
-
-pub enum WorkerStatus {
-    /// 空闲
-    Idle,
-    /// 工作中
-    Working { jobs: HashMap<JobId, WorkerJob> },
-    /// 死亡
-    Died,
-}
-
-id_new_type!(JobId);
-
-pub struct WorkerJob {
-    id: JobId,
-    task: Arc<RwLock<Task>>,
-    params: WorkerJobParams,
-    progress: Progress,
-}
-
-impl WorkerJob {
-    fn coefficient(&self) -> f64 {
-        todo!()
-    }
-}
-
-pub enum WorkerJobParams {
-    Parse(ParseParams),
-    Thumbnail(ThumbnailParams),
-}
-
-pub struct ThumbnailParams {}
-
-pub struct ParseParams {
-    path: PathBuf,
-}
-
-pub enum WorkerType {
-    Parse,
-    Thumbnail,
-}
-
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
-use utils::id_macro::{self, derive_more};
-
-use crate::controller::worker::{JobOutput, ParseOutput};
-
-// outter event
-impl Manager {
-    pub fn new_task(&self, task: Task) {
-        // dispatch
-        todo!()
-    }
-
-    pub fn job_done(&self, worker_id: WorkerId, job_id: JobId, res: JobOutput) {
-        // move job to done
-        match res {
-            JobOutput::Parse(parse) => {
-                let mut workers = self.workers.write();
-                if let Some(worker) = workers.get_mut(&worker_id) {
-                    match &mut worker.status {
-                        WorkerStatus::Idle => {
-                            info!(%worker_id, "received event from idle worker");
-                        }
-                        WorkerStatus::Working { jobs } => {
-                            if let Some(job) = jobs.remove(&job_id) {
-                                let task = job.task.read();
-                                let task_id = task.id;
-                                self.task_done(task_id, TaskOutput::Parse(parse)).unwrap();
-                            }
-                        }
-                        WorkerStatus::Died => {
-                            info!(%worker_id, "received event from dead worker");
-                        }
-                    }
-                }
-            }
-            JobOutput::Thumbnail => {
-                let mut workers = self.workers.write();
-                if let Some(worker) = workers.get_mut(&worker_id) {
-                    match &mut worker.status {
-                        WorkerStatus::Idle => {
-                            info!(%worker_id, "received event from idle worker");
-                        }
-                        WorkerStatus::Working { jobs } => {
-                            if let Some(job) = jobs.remove(&job_id) {
-                                let task_id = job.task.read().id;
-                                self.task_done(task_id, TaskOutput::Thumbnail).unwrap();
-                            }
-                        }
-                        WorkerStatus::Died => {
-                            info!(%worker_id, "received event from dead worker");
-                        }
-                    }
-                }
-            }
-        }
-        todo!()
-    }
-
-    pub fn job_failed(&self, worker_id: WorkerId, job_id: JobId) {
-        // move job to failed
-        todo!()
-    }
-
-    pub fn job_progress(&self, worker_id: WorkerId, job_id: JobId, progress: Progress) {
-        // update job progress
-        let mut workers = self.workers.write();
-        if let Some(worker) = workers.get_mut(&worker_id) {
-            match &mut worker.status {
-                WorkerStatus::Idle => {
-                    info!(%worker_id, "received event from idle worker");
-                }
-                WorkerStatus::Working { jobs } => {
-                    if let Some(job) = jobs.get_mut(&job_id) {
-                        job.progress = progress;
-
-                        // let mut tasks = self.tasks.write();
-                        // if let Some(task) = tasks.get_mut(&job.task_id) {
-                        //     if job.progress.finished >= job.progress.total {
-                        //         todo!()
-                        //     }
-                        // }
-                    } else {
-                        warn!(%worker_id, "no such worker");
-                    }
-                }
-                WorkerStatus::Died => {
-                    info!(%worker_id, "received event from dead worker");
-                }
-            }
-        }
-        todo!()
-    }
-
-    pub fn worker_died(&self, worker_id: i64) {
-        // move worker to died
-        todo!()
-    }
-
-    pub fn task_ended(&self, task_id: i64) {
-        // move task to ended
-        todo!()
-    }
+pub enum TaskStatus {
+    Running(Progress),
+    Done,
+    Failed(String),
 }
 
 pub struct Progress {
-    total: u32,
-    finished: u32,
+    total: u64,
+    current: u64,
 }
 
-pub struct TaskEvent {
-    task_id: TaskId,
-    msg: TaskEventMsg,
+pub trait Task: TryFrom<TaskRaw> {
+    type Job: Job<Task = Self>;
+
+    fn id(&self) -> i64;
+
+    fn status(&self) -> TaskStatus;
+
+    fn result(&self) -> Option<TaskResult>;
+
+    fn handle_event<J: JobEvent>(&mut self, event: &J);
+
+    fn next_job(&mut self) -> Option<Self::Job>;
+
+    fn have_next_job(&self) -> bool;
 }
 
-pub enum TaskEventMsg {
-    Failed,
-    Done(TaskOutput),
+pub trait JobEvent {
+    type Task: Task;
+    type Job: Job<Task = Self::Task>;
+
+    fn job_id(&self) -> i64;
+
+    fn task_id(&self) -> i64;
 }
 
-use derive_more::From;
+pub trait Job: serde::Serialize + Into<JobRaw> {
+    type Task: Task;
 
-#[derive(From)]
-pub enum TaskOutput {
-    Parse(ParseOutput),
-    Thumbnail,
+    fn worker_type(&self) -> WorkerType;
 }
 
-// publish
-impl Manager {
-    pub fn subcribe_task_status(&self) {
-        todo!()
-    }
-
-    pub fn subcribe_job(&self) {
-        todo!()
-    }
-
-    fn task_done(&self, task_id: TaskId, task_output: TaskOutput) -> Result<()> {
-        // self.task_res_subscriber
-        //     .send(TaskEvent {
-        //         task_id,
-        //         msg: TaskEventMsg::Done(task_output),
-        //     })
-        //     .unwrap();
-        // let mut tasks = self.tasks.write();
-        // tasks.remove(&task_id);
-        todo!()
-    }
-
-    fn task_failed(&self, task_id: i64) -> Result<()> {
-        todo!()
-    }
+#[derive(Hash, Eq, PartialEq, Clone, Debug, Copy)]
+pub enum WorkerType {
+    Parse,
 }
 
-// command
-impl Manager {
-    pub fn worker_register(&self, worker: Worker) {
-        todo!()
-    }
+pub trait TaskRepo {
+    fn get<T>(&mut self, task_id: i64) -> Option<T>
+    where
+        T: Task;
 
-    pub fn pause_worker(&self, worker_id: i64) {
-        todo!()
-    }
+    fn save<T>(&mut self, task: T)
+    where
+        T: Task;
 
-    pub fn resume_worker(&self, worker_id: i64) {
-        todo!()
-    }
+    fn del(&mut self, task_id: i64);
 
-    pub fn kill_worker(&self, worker_id: i64) {
-        todo!()
-    }
-
-    pub fn dispatch(&self) -> Vec<Task> {
-        todo!()
-    }
-
-    pub fn pause_task(&self, task_id: i64) {
-        todo!()
-    }
-
-    pub fn resume_task(&self, task_id: i64) {
-        todo!()
-    }
-
-    pub fn cancel_task(&self, task_id: i64) {
-        todo!()
-    }
+    fn exist(&self, task_id: i64) -> bool;
 }
 
-// query
-impl Manager {
-    pub fn get_task(&self, task_id: i64) -> Option<Task> {
-        todo!()
-    }
-
-    pub fn get_worker(&self, worker_id: i64) -> Option<Worker> {
-        todo!()
-    }
-
-    pub fn get_workers(&self) -> Vec<Worker> {
-        todo!()
-    }
-
-    pub fn get_tasks(&self) -> Vec<Task> {
-        todo!()
-    }
-
-    pub fn sync_status(&self) {
-        todo!()
-    }
+pub struct Worker {
+    id: i64,
+    type_: WorkerType,
+    weight: u64,
 }
 
-pub struct WorkerEvent {
-    worker_id: i64,
-    task_id: i64,
-    msg: WorkerEventMsg,
+impl Worker {
+    fn new_job(&mut self, job: JobRaw) {}
 }
 
-pub enum WorkerEventMsg {
-    /// 任务完成
-    TaskDone,
-    /// 任务失败
-    TaskFailed { reason: String },
-    /// 任务进度
-    TaskProgress { step: TaskStep },
+pub trait WorkerRepo {
+    fn rand_idle_worker(&mut self, ty: WorkerType) -> Option<Worker>;
+}
+
+pub enum TaskResult {
+    Success(i64),
+    Failure(String),
+}
+
+trait TaskResultSubscriber {
+    fn on_task_result(&mut self, result: TaskResult);
+}
+
+pub struct Manager<TR, WR> {
+    task_repo: TR,
+    worker_repo: WR,
+    task_result_subscritber: Box<dyn TaskResultSubscriber>,
+    job_queue: HashMap<WorkerType, VecDeque<JobRaw>>,
+}
+
+pub struct JobRaw {}
+
+impl<TR, WR> Manager<TR, WR>
+where
+    TR: TaskRepo,
+    WR: WorkerRepo,
+{
+    pub fn new_task<T: Task>(&mut self, mut task: T) {
+        if self.task_repo.exist(task.id()) {
+            return;
+        }
+        self.collect_jobs(&mut task);
+        self.task_repo.save(task);
+    }
+
+    pub fn job_event<E: JobEvent>(&mut self, event: E) {
+        let Some(mut task)= self.task_repo.get::<E::Task>(event.task_id()) else {
+            return;
+        };
+
+        task.handle_event(&event);
+        if let Some(result) = task.result() {
+            self.task_result_subscritber.on_task_result(result);
+            self.task_repo.del(task.id());
+        } else {
+            if task.have_next_job() {
+                self.collect_jobs(&mut task);
+                self.dispatch_job();
+            }
+
+            self.task_repo.save(task)
+        }
+    }
+
+    fn collect_jobs<T: Task>(&mut self, task: &mut T) {
+        while let Some(job) = task.next_job() {
+            let queue = self.job_queue.entry(job.worker_type()).or_default();
+            queue.push_back(job.into());
+        }
+    }
+
+    fn dispatch_job(&mut self) {
+        for (ty, queue) in self.job_queue.iter_mut() {
+            if queue.is_empty() {
+                continue;
+            }
+
+            let Some(mut worker) = self.worker_repo.rand_idle_worker(*ty) else {
+                continue;
+            };
+
+            while let Some(job) = queue.pop_front() {
+                // ?dead
+                worker.new_job(job);
+
+                match self.worker_repo.rand_idle_worker(*ty) {
+                    Some(w) => worker = w,
+                    None => break,
+                }
+            }
+        }
+    }
 }
