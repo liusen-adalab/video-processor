@@ -1,12 +1,6 @@
-#![allow(unused)]
 mod transcode;
 
-use std::{
-    any::Any,
-    collections::{HashMap, VecDeque},
-};
-
-use tokio::sync::mpsc;
+use std::collections::{HashMap, VecDeque};
 
 pub struct TaskRaw {}
 
@@ -16,6 +10,7 @@ pub enum TaskStatus {
     Failed(String),
 }
 
+#[allow(unused)]
 pub struct Progress {
     total: u64,
     current: u64,
@@ -71,6 +66,7 @@ pub trait TaskRepo {
     fn exist(&self, task_id: i64) -> bool;
 }
 
+#[allow(unused)]
 pub struct Worker {
     id: i64,
     type_: WorkerType,
@@ -78,7 +74,7 @@ pub struct Worker {
 }
 
 impl Worker {
-    fn new_job(&mut self, job: JobRaw) {}
+    fn new_job(&mut self, _job: JobRaw) {}
 }
 
 pub trait WorkerRepo {

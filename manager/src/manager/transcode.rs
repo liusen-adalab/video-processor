@@ -1,4 +1,6 @@
 pub mod params {
+    #![allow(unused)]
+
     #[derive(Clone)]
     pub struct ZcodeParams {
         pub format: VideoFormat,
