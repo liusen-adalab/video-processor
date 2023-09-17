@@ -18,4 +18,4 @@ typetag = "0.2.13"
 
 [dependencies.utils]
 path = "../utils"
-features = ["diesel"]
+features = ["diesel", "codec"]
