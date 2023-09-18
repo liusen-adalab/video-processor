@@ -55,12 +55,30 @@ macro_rules! encoder {
         $crate::encoder!(@impl $item $(<$($tt)+>)?, $codec);
     };
 
-    (@impl $item:ident $(<$($tt:tt),+>)?, $codec:ident  $(<$($de_generic:tt),+>)?) => {
+    (@impl $item:ident, $codec:ident  $(<$($de_generic:tt),+>)?) => {
         const _: () = {
             use $crate::macros::codec::bytes::BytesMut;
             use $crate::macros::codec::tokio_util::codec::Encoder;
 
-            impl$(<$($tt),+ , $($de_generic)+>)? Encoder<$item $(<$($tt)+>)? > for $codec $(<$($de_generic)+>)?
+            impl$(<$($de_generic)+>)? Encoder<$item> for $codec $(<$($de_generic)+>)?
+            {
+                type Error = anyhow::Error;
+
+                fn encode(&mut self, item: $item, dst: &mut BytesMut) -> Result<(), Self::Error> {
+                    let msg = $crate::macros::codec::bincode::serialize(&item)?;
+                    self.len_codec.encode(msg.into(), dst)?;
+                    Ok(())
+                }
+            }
+        };
+    };
+
+    (@impl $item:ident $(<$($tt:tt),+>)?, $codec:ident) => {
+        const _: () = {
+            use $crate::macros::codec::bytes::BytesMut;
+            use $crate::macros::codec::tokio_util::codec::Encoder;
+
+            impl$(<$($tt),+ >)? Encoder<$item $(<$($tt),+>)? > for $codec
                 $(
                 where
                     $($tt: ::serde::Serialize,)+
@@ -68,7 +86,29 @@ macro_rules! encoder {
             {
                 type Error = anyhow::Error;
 
-                fn encode(&mut self, item: $item $(<$($tt)+>)?, dst: &mut BytesMut) -> Result<(), Self::Error> {
+                fn encode(&mut self, item: $item $(<$($tt),+>)?, dst: &mut BytesMut) -> Result<(), Self::Error> {
+                    let msg = $crate::macros::codec::bincode::serialize(&item)?;
+                    self.len_codec.encode(msg.into(), dst)?;
+                    Ok(())
+                }
+            }
+        };
+    };
+
+    (@impl $item:ident $(<$($tt:tt),+>)?, $codec:ident  $(<$($de_generic:tt),+>)?) => {
+        const _: () = {
+            use $crate::macros::codec::bytes::BytesMut;
+            use $crate::macros::codec::tokio_util::codec::Encoder;
+
+            impl$(<$($tt),+ , $($de_generic)+>)? Encoder<$item $(<$($tt),+>)? > for $codec $(<$($de_generic)+>)?
+                $(
+                where
+                    $($tt: ::serde::Serialize,)+
+                )?
+            {
+                type Error = anyhow::Error;
+
+                fn encode(&mut self, item: $item $(<$($tt),+>)?, dst: &mut BytesMut) -> Result<(), Self::Error> {
                     let msg = $crate::macros::codec::bincode::serialize(&item)?;
                     self.len_codec.encode(msg.into(), dst)?;
                     Ok(())

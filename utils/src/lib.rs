@@ -9,3 +9,5 @@ pub mod id_macro;
 pub mod process;
 
 pub mod macros;
+
+pub mod logger;

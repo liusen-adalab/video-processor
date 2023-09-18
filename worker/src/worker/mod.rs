@@ -1,83 +1,109 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
-use anyhow::{Context, Result};
-use futures::{stream::FuturesUnordered, Future, SinkExt, Stream, StreamExt};
-use pin_project_lite::pin_project;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio::{net::TcpStream, select, sync::oneshot, time};
-use tracing::error;
+use anyhow::{bail, Context, Result};
+use futures::{SinkExt, StreamExt};
+use protocol::{
+    handshake::{HandShakeProtocol, HandShakeReq},
+    manager_msg::{ManagerCmd, ManagerMsg},
+    worker_msg::{JobEvent, JobEventWraper, WorkerMsg},
+    JobType, SystemInfo, TaskId,
+};
+use serde::{de::DeserializeOwned, Serialize};
+use tokio::{net::TcpStream, select, sync::mpsc, time};
+use tracing::{error, info, warn};
 use utils::{
     codec,
-    macros::codec::tokio_util::{self},
+    macros::codec::{
+        bincode,
+        tokio_util::{self, codec::Decoder},
+    },
 };
 
-pub mod parse;
+use self::parse::ParseWorker;
 
-#[derive(Serialize, Deserialize)]
+mod parse;
+
 pub struct WorkerCommonCfg {
-    ty: WorkerType,
-    manager_url: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkerType {
-    Parse,
+    pub worker_type: JobType,
+    pub url: String,
 }
 
 pub fn start(cfg: &'static WorkerCommonCfg) {
-    match cfg.ty {
-        WorkerType::Parse => {}
-    }
-}
-
-fn run_bg<W>(cfg: &'static WorkerCommonCfg)
-where
-    W: Worker,
-    <W::Handler as Future>::Output: Send,
-{
-    tokio::spawn(async move {
-        loop {
-            let tracker = WorkerTracker::<W>::new(cfg).await;
-            if let Err(err) = tracker.run().await {
-                error!("Worker error: {:?}", err);
-            }
-            tokio::time::sleep(Duration::from_secs(10)).await;
+    match cfg.worker_type {
+        JobType::Parse => {
+            WorkerRouter::<ParseWorker>::run_bg(cfg);
         }
-    });
-    todo!()
+    }
 }
 
-struct WorkerTracker<W: Worker> {
-    state: State,
-    conn: Connection<W::Job>,
+trait Worker: 'static + Send {
+    type Job: Job;
+    type Output: Serialize + Send + 'static;
+    type Handler: WorkerHandler;
+
+    fn worker_type() -> JobType;
+
+    fn spawn(
+        job: Self::Job,
+        chan: mpsc::UnboundedSender<JobEventWraper<Self::Output>>,
+    ) -> Self::Handler;
+}
+
+trait Job: DeserializeOwned + Send + 'static {
+    fn task_id(&self) -> TaskId;
+}
+
+trait WorkerHandler: Send + 'static {
+    fn cancel(self);
+}
+
+codec!(WorkerCodec, encode: WorkerMsg<E>, decode: ManagerMsg);
+
+type Framed = tokio_util::codec::Framed<TcpStream, WorkerCodec>;
+
+struct Connection<W: Worker> {
+    url: String,
+    conn: Framed,
+    phamtom: std::marker::PhantomData<W>,
+}
+
+struct WorkerRouter<W: Worker> {
+    conn: Connection<W>,
     job_count: usize,
-    jobs: FuturesUnordered<W::Handler>,
+    jobs: HashMap<TaskId, Vec<W::Handler>>,
+    recv: mpsc::UnboundedReceiver<JobEventWraper<W::Output>>,
+    send: mpsc::UnboundedSender<JobEventWraper<W::Output>>,
 }
 
-impl<W: Worker> Drop for WorkerTracker<W> {
-    fn drop(&mut self) {
-        todo!()
-    }
-}
-
-enum State {
-    Paused,
-    Running,
-}
-
-impl<W: Worker> WorkerTracker<W> {
-    async fn new(cfg: &WorkerCommonCfg) -> Self {
-        let tracker = WorkerTracker::<W> {
-            state: State::Running,
-            conn: Connection::connect_until_success(&cfg.manager_url).await,
+impl<W> WorkerRouter<W>
+where
+    W: Worker + 'static,
+{
+    async fn new(cfg: &'static WorkerCommonCfg) -> Self {
+        let conn = Connection::connect_until_success(&cfg.url).await;
+        let (send, recv) = mpsc::unbounded_channel();
+        Self {
+            conn,
+            job_count: Default::default(),
             jobs: Default::default(),
-            job_count: 0,
-        };
-        tracker
+            recv,
+            send,
+        }
     }
 
-    async fn run(mut self) -> Result<()> {
+    fn run_bg(cfg: &'static WorkerCommonCfg) {
+        tokio::spawn(async move {
+            let mut router = WorkerRouter::<W>::new(cfg).await;
+            loop {
+                if let Err(err) = router.run().await {
+                    error!("router error: {}", err);
+                    router.conn = Connection::connect_until_success(&cfg.url).await;
+                }
+            }
+        });
+    }
+
+    async fn run(&mut self) -> Result<()> {
         let mut report_interval = time::interval(Duration::from_secs(5));
         loop {
             select! {
@@ -87,19 +113,47 @@ impl<W: Worker> WorkerTracker<W> {
                 _ = report_interval.tick() => {
                     self.report_info().await?;
                 }
-                Some(output) = self.jobs.next() => {
-                    self.report_ouput(output).await?;
+                Some(event) = self.recv.recv() => {
+                    self.handler_worker_event(event).await?;
                 }
             }
         }
     }
 
-    async fn report_ouput(&mut self, output: <W::Handler as Future>::Output) -> Result<()> {
-        self.conn
-            .send(WorkerMsg::JobReport(output))
-            .await
-            .context("send job output")?;
-        todo!()
+    async fn handler_worker_event(&mut self, event: JobEventWraper<W::Output>) -> Result<()> {
+        if matches!(event.event, JobEvent::Ok(_) | JobEvent::Err(_)) {
+            self.job_count -= 1;
+        }
+        self.conn.send(WorkerMsg::JobEvent(event)).await?;
+        Ok(())
+    }
+
+    async fn handle_msg(&mut self, msg: ManagerMsg) -> Result<()> {
+        match msg.cmd {
+            ManagerCmd::CancelTask(id) => {
+                self.cancel_task(id).await?;
+            }
+            ManagerCmd::Job(job) => {
+                let job =
+                    bincode::deserialize::<W::Job>(&job.payload).context("job type not match")?;
+                self.job_count += 1;
+                let task_id = job.task_id();
+                let h = W::spawn(job, self.send.clone());
+                self.jobs.entry(task_id).or_default().push(h);
+            }
+        }
+        Ok(())
+    }
+
+    async fn cancel_task(&mut self, id: TaskId) -> Result<()> {
+        if let Some(handlers) = self.jobs.remove(&id) {
+            for h in handlers {
+                h.cancel();
+            }
+        } else {
+            warn!("Task {} not found", id);
+        }
+        Ok(())
     }
 
     async fn report_info(&mut self) -> Result<()> {
@@ -110,74 +164,59 @@ impl<W: Worker> WorkerTracker<W> {
             .context("send system info")?;
         Ok(())
     }
-
-    async fn handle_msg(&mut self, msg: ManagerMsg<W::Job>) -> Result<()> {
-        match msg.cmd {
-            ManagerCmd::Pause => self.state = State::Paused,
-            ManagerCmd::Resume => self.state = State::Running,
-            ManagerCmd::CancelTask(id) => {
-                self.cancel_task(id).await;
-            }
-            ManagerCmd::Job(job) => {
-                self.job_count += 1;
-                self.jobs.push(W::run(job));
-            }
-        }
-        Ok(())
-    }
-
-    async fn cancel_task(&mut self, id: TaskId) {
-        let jobs = std::mem::replace(&mut self.jobs, FuturesUnordered::new());
-        self.jobs = jobs
-            .into_iter()
-            .filter_map(|j| {
-                if j.task_id() == id {
-                    j.stop();
-                    self.job_count -= 1;
-                    None
-                } else {
-                    Some(j)
-                }
-            })
-            .collect();
-    }
 }
 
-type Framed<J> = tokio_util::codec::Framed<TcpStream, WorkerCodec<J>>;
+codec!(HandShakeCodec, encode: HandShakeProtocol, decode: HandShakeProtocol);
 
-struct Connection<Job> {
-    url: String,
-    state: ConnectionState,
-    conn: Framed<Job>,
-}
-
-enum ConnectionState {
-    Connected,
-    Disconnected,
-}
-
-impl<J> Connection<J> {
-    async fn send<M: Serialize>(&mut self, msg: WorkerMsg<M>) -> Result<()> {
-        self.conn.send(msg).await?;
-        Ok(())
-    }
-}
-
-impl<J> Connection<J>
-where
-    J: DeserializeOwned,
-{
+impl<W: Worker> Connection<W> {
     async fn connect_until_success(url: &str) -> Self {
         let framed = Self::framed_loop(url).await;
         Self {
-            state: ConnectionState::Connected,
             conn: framed,
             url: url.to_string(),
+            phamtom: std::marker::PhantomData,
         }
     }
 
-    async fn framed_loop(url: &str) -> Framed<J> {
-        let mut wait = Duration::from_secs(1);
+    async fn handshake(stream: TcpStream) -> Result<Framed> {
+        info!("performing handshake");
+        let mut framed = HandShakeCodec::new().framed(stream);
+        framed
+            .send(HandShakeProtocol::Req(HandShakeReq {
+                worker_type: W::worker_type(),
+                pid: 1,
+                system: SystemInfo { cpu: 1.0, mem: 1.0 },
+            }))
+            .await
+            .context("send handshake request")?;
+
+        match framed.next().await {
+            Some(Ok(resp)) => match resp {
+                HandShakeProtocol::Resp(resp) => {
+                    if resp.accepted {
+                        info!("Handshake success");
+                        let framed = WorkerCodec::new().framed(framed.into_inner());
+                        return Ok(framed);
+                    } else {
+                        warn!("server reject handshake");
+                    }
+                }
+                _ => {
+                    error!("Handshake resp not match");
+                }
+            },
+            Some(Err(err)) => {
+                error!("Handshake resp decode error: {}", err);
+            }
+            None => {
+                error!("Handshake connection closed")
+            }
+        }
+        bail!("Handshake failed")
+    }
+
+    async fn framed_loop(url: &str) -> Framed {
+        let mut wait = Duration::from_secs(2);
         let max = Duration::from_secs(20);
 
         loop {
@@ -185,31 +224,30 @@ where
                 Ok(f) => break f,
                 Err(err) => {
                     error!("Connection error: {}", err);
-                    time::sleep(wait).await;
                     wait += Duration::from_secs(2);
-                    wait = wait.max(max);
+                    wait = wait.min(max);
                 }
             }
+            time::sleep(wait).await;
         }
     }
 
-    async fn framed(url: &str) -> Result<Framed<J>> {
+    async fn framed(url: &str) -> Result<Framed> {
+        info!("connecting server");
         let tcp = TcpStream::connect(url).await?;
-        let framed = Framed::new(tcp, WorkerCodec::new());
+        let framed = Self::handshake(tcp).await?;
         Ok(framed)
     }
 
-    async fn next(&mut self) -> ManagerMsg<J> {
+    async fn next(&mut self) -> ManagerMsg {
         loop {
             let msg = self.conn.next().await;
             match msg {
                 Some(Ok(msg)) => break msg,
                 Some(Err(err)) => {
-                    self.state = ConnectionState::Disconnected;
                     error!("Error: {}", err);
                 }
                 None => {
-                    self.state = ConnectionState::Disconnected;
                     error!(%self.url, "Connection closed");
                 }
             }
@@ -217,106 +255,9 @@ where
             self.conn = Self::framed_loop(&self.url).await;
         }
     }
-}
 
-#[derive(Deserialize)]
-pub struct ManagerMsg<J> {
-    cmd: ManagerCmd<J>,
-}
-
-type TaskId = i64;
-
-#[derive(Deserialize)]
-pub enum ManagerCmd<J> {
-    Pause,
-    Resume,
-    CancelTask(TaskId),
-    Job(J),
-}
-
-#[derive(Serialize)]
-pub enum WorkerMsg<R = ()> {
-    JobReport(R),
-    Heartbeat,
-    SystemInfo(SystemInfo),
-}
-
-impl<R> From<SystemInfo> for WorkerMsg<R> {
-    fn from(value: SystemInfo) -> Self {
-        WorkerMsg::SystemInfo(value)
+    async fn send<O: Serialize>(&mut self, msg: WorkerMsg<O>) -> Result<()> {
+        self.conn.send(msg).await?;
+        Ok(())
     }
-}
-
-#[derive(Serialize)]
-pub struct SystemInfo {
-    cpu: f64,
-    mem: f64,
-}
-
-codec!(WorkerCodec, encode: WorkerMsg<R>, decode: ManagerMsg<J>);
-
-trait Worker {
-    type Job: Job<Worker = Self>;
-    type Output: Send + 'static + Serialize;
-    type Handler: WorkerHandler<Output = Self::Output>;
-
-    fn run(job: Self::Job) -> Self::Handler;
-}
-
-trait Job: Sized + DeserializeOwned + Send + Sync + 'static {
-    type Worker: Worker<Job = Self>;
-
-    fn task_id(&self) -> TaskId;
-}
-
-trait WorkerHandler: 'static + Send + Sync + Unpin + Future {
-    type EventStream: Stream<Item = JobEvent>;
-
-    fn task_id(&self) -> TaskId;
-
-    fn stop(&self);
-
-    fn event_stream(&self) -> Option<Self::EventStream>;
-}
-
-pub struct JobEvent {
-    pub task_id: TaskId,
-}
-
-pin_project! {
-    pub struct CommonJobHandler<T> {
-        #[pin]
-        resp: oneshot::Receiver<T>,
-        handle: oneshot::Sender<()>,
-    }
-}
-
-impl<T> CommonJobHandler<T> {
-    fn new() -> Self {
-        todo!()
-    }
-}
-
-impl<T> Future for CommonJobHandler<T> {
-    type Output = T;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let this = self.project();
-
-        this.resp.poll(cx).map(|r| r.unwrap())
-    }
-}
-
-async fn bb() {}
-
-fn aa() {
-    let mut a = FuturesUnordered::new();
-    a.push(bb());
-    a.push(bb());
-
-    let b = FuturesUnordered::new();
-    b.push(bb());
 }
